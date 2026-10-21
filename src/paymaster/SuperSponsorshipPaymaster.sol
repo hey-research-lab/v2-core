@@ -7,12 +7,24 @@ import { PackedUserOperation } from "modulekit/external/ERC4337.sol";
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { BasePaymaster } from "../vendor/account-abstraction/BasePaymaster.sol";
 import { ISuperSponsorshipPaymaster } from "../interfaces/ISuperSponsorshipPaymaster.sol";
+import { ISuperVaultAggregator } from "../interfaces/ISuperVaultAggregator.sol";
 
 /// @title SuperSponsorshipPaymaster
 /// @author Superform Labs
 /// @notice Paymaster with per-strategy gas sponsorship budgets.
-///         Treasury funds the paymaster per chain, managers credit strategy buckets,
-///         and gas costs are debited from the relevant strategy's budget.
+///         Anyone may fund a strategy's budget (a vault manager at creation, treasury, a keeper
+///         topping up), FUNDING_ROLE moves already-deposited balance between buckets and
+///         withdraws, and gas costs are debited from the relevant strategy's budget.
+///
+/// @dev Funding is permissionless because adding ETH to a budget can only ever benefit that
+///      strategy: the budget is spendable solely by UserOps from the strategy's allowed sender,
+///      which the SuperVaultExecutor further gates by that strategy's own session keys. A
+///      third-party funder cannot reclaim WHAT THEY SENT: a budget exits only via FUNDING_ROLE
+///      (`withdrawStrategyFunds`, to any recipient) or the strategy's PRIMARY MANAGER
+///      (`withdrawStrategyFundsAsManager`, to themselves). The primary manager can therefore reclaim
+///      the whole remaining budget — including donor/treasury top-ups — to wind the strategy down.
+///      That is intended: the manager already controls where the budget is spent (allowed sender +
+///      session keys), so a donor is trusting that manager when they fund.
 ///
 /// @dev Accounting model (pre-charge / refund):
 ///      - `_validatePaymasterUserOp` reserves `maxCost` from the strategy balance upfront,
@@ -30,7 +42,7 @@ contract SuperSponsorshipPaymaster is BasePaymaster, AccessControl, ISuperSponso
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
 
     // deployment version
-    uint256 public constant VERSION = 5;
+    uint256 public constant VERSION = 7;
 
     /// @notice Default UserOp gas limit cap when strategy has no explicit maxSingleOpCost.
     ///         Prevents inflated gas limit attacks. Enforced by checking that
@@ -38,10 +50,10 @@ contract SuperSponsorshipPaymaster is BasePaymaster, AccessControl, ISuperSponso
     ///         Managers can override per strategy by setting maxSingleOpCost to a non-zero value.
     uint256 public constant DEFAULT_MAX_GAS = 4_000_000;
 
-    /// @notice Canonical SuperVaultExecutor address.
-    ///         Convenience constant for setAllowedSender() calls during deployment.
-    ///         Not auto-applied — each strategy requires an explicit setAllowedSender(strategy, SVE)
-    ///         call after funding, otherwise validation will revert (default-deny).
+    /// @notice Canonical SuperVaultExecutor address, identical on every chain (CREATE2).
+    ///         Applied automatically the first time a strategy is funded, unless a manager has
+    ///         already configured that strategy's sender. After that, only setAllowedSender
+    ///         changes it, so a manager's explicit reset to address(0) is never undone by funding.
     address public constant DEFAULT_ALLOWED_SENDER = 0x183e3171EEf801cE2A29FD48B3b21188f241875d;
 
     /// @notice Expected selector for SuperVaultExecutor.executeFromEntryPoint(address, bytes) = 0x4fb2fbd5
@@ -75,6 +87,12 @@ contract SuperSponsorshipPaymaster is BasePaymaster, AccessControl, ISuperSponso
     /// @notice Per-strategy allowed sender. Must be set (non-zero) for UserOps to be accepted (default-deny).
     mapping(address strategy => address) public allowedSender;
 
+    /// @notice Whether a strategy's sender has ever been set, by a manager or by first funding.
+    /// @dev Distinguishes "never configured" from "a manager deliberately reset it to address(0)".
+    ///      Only the former lets fundStrategy apply DEFAULT_ALLOWED_SENDER, so the reset-to-zero
+    ///      block cannot be re-armed by a stranger sending 1 wei.
+    mapping(address strategy => bool) public senderInitialized;
+
     /// @notice Sum of all strategy balances
     uint256 public totalAllocated;
 
@@ -91,32 +109,51 @@ contract SuperSponsorshipPaymaster is BasePaymaster, AccessControl, ISuperSponso
     /// @notice Global pause flag
     bool public globalPaused;
 
+    /// @notice SuperVaultAggregator used to authorize a strategy's primary manager for self-withdrawal.
+    /// @dev Immutable and environment-specific (the aggregator has a different address on staging than prod),
+    ///      so it is passed at construction rather than hardcoded. Only `withdrawStrategyFundsAsManager`
+    ///      reads it; a misconfigured address fails that call closed (no manager can withdraw) and never
+    ///      affects funding, sponsorship, or the FUNDING_ROLE withdrawal path.
+    ISuperVaultAggregator public immutable SUPER_VAULT_AGGREGATOR;
+
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
     /// @param entryPoint_ The ERC-4337 EntryPoint contract
     /// @param admin_ Initial admin granted DEFAULT_ADMIN_ROLE, FUNDING_ROLE, and MANAGER_ROLE
-    constructor(IEntryPoint entryPoint_, address admin_) payable BasePaymaster(entryPoint_) {
+    /// @param aggregator_ The SuperVaultAggregator that resolves a strategy's primary manager
+    constructor(
+        IEntryPoint entryPoint_,
+        address admin_,
+        address aggregator_
+    )
+        payable
+        BasePaymaster(entryPoint_)
+    {
         if (admin_ == address(0)) revert ZERO_ADDRESS();
+        if (aggregator_ == address(0)) revert ZERO_ADDRESS();
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(FUNDING_ROLE, admin_);
         _grantRole(MANAGER_ROLE, admin_);
 
+        SUPER_VAULT_AGGREGATOR = ISuperVaultAggregator(aggregator_);
         postOpGasOverhead = MIN_POST_OP_OVERHEAD;
     }
 
     /*//////////////////////////////////////////////////////////////
-                        FUNDING (FUNDING_ROLE)
+            FUNDING (fundStrategy: anyone; credit/withdraw: FUNDING_ROLE)
     //////////////////////////////////////////////////////////////*/
 
     /// @inheritdoc ISuperSponsorshipPaymaster
-    function fundStrategy(address strategy) external payable onlyRole(FUNDING_ROLE) {
+    function fundStrategy(address strategy) external payable {
         if (strategy == address(0)) revert ZERO_ADDRESS();
         if (msg.value == 0) revert ZERO_AMOUNT();
 
         _budgets[strategy].balance += msg.value;
         totalAllocated += msg.value;
+
+        _applyDefaultSenderIfNeverConfigured(strategy);
 
         // Deposit to EntryPoint so the paymaster has sufficient deposit for UserOps
         entryPoint.depositTo{ value: msg.value }(address(this));
@@ -133,7 +170,23 @@ contract SuperSponsorshipPaymaster is BasePaymaster, AccessControl, ISuperSponso
         _budgets[strategy].balance += amount;
         totalAllocated += amount;
 
+        // Same rule as fundStrategy. FUNDING_ROLE and MANAGER_ROLE are held by different
+        // governance accounts after role transfer, so a credit must not leave the budget unusable
+        // until a second account acts.
+        _applyDefaultSenderIfNeverConfigured(strategy);
+
         emit StrategyCredited(strategy, amount);
+    }
+
+    /// @dev First funding or credit of a never-configured strategy: apply the canonical executor
+    ///      as sender so a freshly created vault can execute without a separate MANAGER_ROLE
+    ///      transaction. Never touches a strategy a manager has configured, including one
+    ///      deliberately reset to address(0) as a block.
+    function _applyDefaultSenderIfNeverConfigured(address strategy) internal {
+        if (senderInitialized[strategy]) return;
+        senderInitialized[strategy] = true;
+        allowedSender[strategy] = DEFAULT_ALLOWED_SENDER;
+        emit AllowedSenderSet(strategy, DEFAULT_ALLOWED_SENDER);
     }
 
     /// @inheritdoc ISuperSponsorshipPaymaster
@@ -149,6 +202,45 @@ contract SuperSponsorshipPaymaster is BasePaymaster, AccessControl, ISuperSponso
         entryPoint.withdrawTo(payable(to), amount);
 
         emit StrategyWithdrawn(strategy, to, amount);
+    }
+
+    /// @inheritdoc ISuperSponsorshipPaymaster
+    /// @dev Permissionless funding (anyone can top up) is matched by a manager-gated exit: the strategy's
+    ///      primary manager can reclaim its remaining gas budget to themselves so a vault can wind down
+    ///      without waiting on FUNDING_ROLE. Authority is the SuperVaultAggregator's `isMainManager`, the
+    ///      same check SuperVaultExecutor uses; funds go to the verified caller (never an arbitrary address),
+    ///      so a non-manager cannot redirect them. Donors/keepers who funded do not get refunds by design —
+    ///      the budget belongs to the strategy and exits only to its primary manager. Checks-effects-
+    ///      interactions: balances are updated before the EntryPoint withdrawal.
+    ///
+    ///      Deliberately immediate and without a cancel-on-handover timelock (unlike the aggregator's upkeep
+    ///      withdrawal). An outgoing manager can front-run a `changePrimaryManager` to drain the budget, but
+    ///      that is bounded by the remaining gas-only budget and is economically equivalent to the manager's
+    ///      pre-existing power to burn it through legitimate UserOps while still in office — so the budget does
+    ///      NOT transition to a new manager the way upkeep does, by design.
+    ///
+    ///      Gated on `globalPaused` so a `reconcile()` desync freeze also halts this untrusted exit; the
+    ///      authorizing aggregator is an immutable, fail-closed dependency (a wrong/migrated address only
+    ///      disables this path, never funding, sponsorship, or the FUNDING_ROLE withdrawal).
+    function withdrawStrategyFundsAsManager(address strategy, uint256 amount) external {
+        if (strategy == address(0)) revert ZERO_ADDRESS();
+        if (amount == 0) revert ZERO_AMOUNT();
+        // Respect the reconcile() freeze. When totalAllocated drifts above the real EntryPoint deposit,
+        // reconcile() snaps totalAllocated down but leaves per-strategy balances inflated and sets
+        // globalPaused. Unlike the FUNDING_ROLE path (trusted governance that coordinates the budget fix),
+        // this is an untrusted first-come exit, so it must not let a manager realize an inflated balance and
+        // socialize the shortfall onto strategies that withdraw later.
+        if (globalPaused) revert GLOBAL_PAUSED();
+        if (!SUPER_VAULT_AGGREGATOR.isMainManager(msg.sender, strategy)) revert NOT_PRIMARY_MANAGER();
+        if (amount > _budgets[strategy].balance) revert WITHDRAW_EXCEEDS_BALANCE();
+        if (amount > entryPoint.balanceOf(address(this))) revert INSUFFICIENT_ENTRYPOINT_DEPOSIT();
+
+        _budgets[strategy].balance -= amount;
+        totalAllocated -= amount;
+
+        entryPoint.withdrawTo(payable(msg.sender), amount);
+
+        emit StrategyWithdrawnByManager(strategy, msg.sender, amount);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -181,6 +273,9 @@ contract SuperSponsorshipPaymaster is BasePaymaster, AccessControl, ISuperSponso
     /// @inheritdoc ISuperSponsorshipPaymaster
     function setAllowedSender(address strategy, address sender) external onlyRole(MANAGER_ROLE) {
         if (strategy == address(0)) revert ZERO_ADDRESS();
+        // A manager's choice is final with respect to funding: once set here, even to address(0),
+        // fundStrategy will not apply the default over it.
+        senderInitialized[strategy] = true;
         allowedSender[strategy] = sender;
         emit AllowedSenderSet(strategy, sender);
     }
@@ -419,8 +514,8 @@ contract SuperSponsorshipPaymaster is BasePaymaster, AccessControl, ISuperSponso
     /// @dev Accept ETH directly. This ETH sits on the contract, NOT in the EntryPoint deposit,
     ///      and therefore cannot be used for gas sponsorship. To make it usable:
     ///      - Admin calls `sweepETH` to send it to a recipient, OR
-    ///      - A FUNDING_ROLE holder calls `fundStrategy` to deposit it into a strategy budget
-    ///        (requires the ETH to be at the sender's address, not on this contract).
+    ///      - Anyone calls `fundStrategy` to deposit it into a strategy budget (requires the ETH
+    ///        to be at the caller's address, not on this contract; funding needs no role).
     ///      ETH received here does NOT appear in `unallocatedBalance()` (which only tracks
     ///      the EntryPoint deposit).
     receive() external payable {

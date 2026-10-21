@@ -10,11 +10,21 @@ import { IERC165 } from "@openzeppelin/contracts/utils/introspection/IERC165.sol
 import { SuperSponsorshipPaymaster } from "../../../src/paymaster/SuperSponsorshipPaymaster.sol";
 import { ISuperSponsorshipPaymaster } from "../../../src/interfaces/ISuperSponsorshipPaymaster.sol";
 import { MockEntryPoint } from "../../mocks/MockEntryPoint.sol";
+import { MockSuperVaultAggregator } from "../../mocks/MockSuperVaultAggregator.sol";
+import { Vm } from "forge-std/Vm.sol";
+
+/// @dev A contract funder (a Safe, a vault factory, a keeper bot). Funding needs no EOA.
+contract FunderContract {
+    function fund(SuperSponsorshipPaymaster p, address strategy) external payable {
+        p.fundStrategy{ value: msg.value }(strategy);
+    }
+}
 import { Helpers } from "../../utils/Helpers.sol";
 
 contract SuperSponsorshipPaymasterTest is Helpers {
     SuperSponsorshipPaymaster public paymaster;
     MockEntryPoint public mockEntryPoint;
+    MockSuperVaultAggregator public aggregator;
 
     address public admin;
     address public funder;
@@ -32,6 +42,7 @@ contract SuperSponsorshipPaymasterTest is Helpers {
 
     function setUp() public {
         mockEntryPoint = new MockEntryPoint();
+        aggregator = new MockSuperVaultAggregator();
 
         admin = makeAddr("admin");
         funder = makeAddr("funder");
@@ -42,7 +53,7 @@ contract SuperSponsorshipPaymasterTest is Helpers {
         recipient = makeAddr("recipient");
         randomUser = makeAddr("randomUser");
 
-        paymaster = new SuperSponsorshipPaymaster(IEntryPoint(address(mockEntryPoint)), admin);
+        paymaster = new SuperSponsorshipPaymaster(IEntryPoint(address(mockEntryPoint)), admin, address(aggregator));
 
         // Grant roles
         vm.startPrank(admin);
@@ -77,12 +88,21 @@ contract SuperSponsorshipPaymasterTest is Helpers {
 
     function test_Constructor_RevertsZeroAdmin() public {
         vm.expectRevert(ISuperSponsorshipPaymaster.ZERO_ADDRESS.selector);
-        new SuperSponsorshipPaymaster(IEntryPoint(address(mockEntryPoint)), address(0));
+        new SuperSponsorshipPaymaster(IEntryPoint(address(mockEntryPoint)), address(0), address(aggregator));
     }
 
     function test_Constructor_RevertsZeroEntryPoint() public {
         vm.expectRevert();
-        new SuperSponsorshipPaymaster(IEntryPoint(address(0)), admin);
+        new SuperSponsorshipPaymaster(IEntryPoint(address(0)), admin, address(aggregator));
+    }
+
+    function test_Constructor_RevertsZeroAggregator() public {
+        vm.expectRevert(ISuperSponsorshipPaymaster.ZERO_ADDRESS.selector);
+        new SuperSponsorshipPaymaster(IEntryPoint(address(mockEntryPoint)), admin, address(0));
+    }
+
+    function test_Constructor_SetsAggregator() public view {
+        assertEq(address(paymaster.SUPER_VAULT_AGGREGATOR()), address(aggregator));
     }
 
     function test_Constructor_GrantsAllRolesToAdmin() public view {
@@ -165,14 +185,126 @@ contract SuperSponsorshipPaymasterTest is Helpers {
         paymaster.fundStrategy{ value: 0 }(strategy1);
     }
 
-    function test_FundStrategy_RevertsNonFundingRole() public {
+    /// @notice Funding needs no role. A vault manager funds at creation; a keeper can top up.
+    function test_FundStrategy_IsPermissionless() public {
+        assertFalse(paymaster.hasRole(FUNDING_ROLE, randomUser), "precondition: no role");
+
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 1 ether);
+        assertEq(paymaster.totalAllocated(), 1 ether);
+        assertEq(mockEntryPoint.balanceOf(address(paymaster)), 1 ether, "lands in the EntryPoint deposit");
+    }
+
+    /// @notice A funder cannot take it back: withdrawal stays with FUNDING_ROLE.
+    function test_FundStrategy_FunderCannotWithdraw() public {
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+
         vm.prank(randomUser);
         vm.expectRevert(
             abi.encodeWithSelector(
                 IAccessControl.AccessControlUnauthorizedAccount.selector, randomUser, FUNDING_ROLE
             )
         );
+        paymaster.withdrawStrategyFunds(strategy1, randomUser, 1 ether);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                FIRST FUNDING APPLIES THE DEFAULT SENDER
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice A never-configured strategy gets the canonical executor as sender on first funding,
+    ///         so a fresh vault is usable with no MANAGER_ROLE transaction.
+    function test_FundStrategy_FirstFundingAppliesDefaultSender() public {
+        address fresh = makeAddr("freshStrategy"); // setUp never touched it
+        assertEq(paymaster.allowedSender(fresh), address(0), "default-deny before funding");
+        assertFalse(paymaster.senderInitialized(fresh));
+
+        vm.expectEmit(true, true, false, false);
+        emit ISuperSponsorshipPaymaster.AllowedSenderSet(fresh, paymaster.DEFAULT_ALLOWED_SENDER());
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(fresh);
+
+        assertEq(paymaster.allowedSender(fresh), paymaster.DEFAULT_ALLOWED_SENDER());
+        assertTrue(paymaster.senderInitialized(fresh));
+    }
+
+    /// @notice Only the first funding touches the sender; later top-ups are pure accounting.
+    function test_FundStrategy_SecondFundingDoesNotTouchSender() public {
+        address fresh = makeAddr("freshStrategy");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(fresh);
+
+        vm.recordLogs();
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(fresh);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 senderSet = keccak256("AllowedSenderSet(address,address)");
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != senderSet, "no second AllowedSenderSet");
+        }
+        assertEq(paymaster.getStrategyBudget(fresh).balance, 2 ether);
+    }
+
+    /// @notice A sender a manager chose is never overwritten by funding.
+    function test_FundStrategy_DoesNotOverrideManagerSetSender() public {
+        // strategy1's sender was set by the manager in setUp
+        vm.prank(randomUser);
         paymaster.fundStrategy{ value: 1 ether }(strategy1);
+        assertEq(paymaster.allowedSender(strategy1), address(0xACC), "manager's choice stands");
+    }
+
+    /// @notice The reset-to-zero block survives funding. Without the initialized flag, a stranger
+    ///         sending 1 wei would re-arm sponsorship for a strategy a manager had blocked.
+    function test_FundStrategy_CannotReArmAManagerResetToZero() public {
+        vm.prank(manager);
+        paymaster.setAllowedSender(strategy1, address(0)); // the block
+        assertTrue(paymaster.senderInitialized(strategy1));
+
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 wei }(strategy1);
+
+        assertEq(paymaster.allowedSender(strategy1), address(0), "still blocked");
+        PackedUserOperation memory op =
+            _createUserOpWithSenderAndGas(strategy1, paymaster.DEFAULT_ALLOWED_SENDER(), 150_000);
+        vm.prank(address(mockEntryPoint));
+        vm.expectRevert(ISuperSponsorshipPaymaster.UNAUTHORIZED_SENDER.selector);
+        paymaster.validatePaymasterUserOp(op, bytes32(0), 0.1 ether);
+    }
+
+    /// @notice The whole point: fund a fresh strategy and a UserOp from the canonical executor
+    ///         validates, with no setAllowedSender call anywhere.
+    function test_FundStrategy_FreshStrategyValidatesFromDefaultSenderWithNoManagerStep() public {
+        address fresh = makeAddr("freshStrategy");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(fresh);
+
+        PackedUserOperation memory op =
+            _createUserOpWithSenderAndGas(fresh, paymaster.DEFAULT_ALLOWED_SENDER(), 150_000);
+        vm.prank(address(mockEntryPoint));
+        (bytes memory context,) = paymaster.validatePaymasterUserOp(op, bytes32(0), 0.1 ether);
+        (address decodedStrategy,) = abi.decode(context, (address, uint256));
+        assertEq(decodedStrategy, fresh);
+
+        // and a non-executor sender is still rejected for that same strategy
+        PackedUserOperation memory bad = _createUserOpWithSenderAndGas(fresh, address(0xBAD), 150_000);
+        vm.prank(address(mockEntryPoint));
+        vm.expectRevert(ISuperSponsorshipPaymaster.UNAUTHORIZED_SENDER.selector);
+        paymaster.validatePaymasterUserOp(bad, bytes32(0), 0.1 ether);
+    }
+
+    /// @notice setAllowedSender marks the strategy configured, whatever value it sets.
+    function test_SetAllowedSender_MarksInitialized() public {
+        address fresh = makeAddr("freshStrategy");
+        vm.prank(manager);
+        paymaster.setAllowedSender(fresh, address(0xACC));
+        assertTrue(paymaster.senderInitialized(fresh));
+
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(fresh);
+        assertEq(paymaster.allowedSender(fresh), address(0xACC), "not replaced by the default");
     }
 
     function testFuzz_FundStrategy(uint256 amount) public {
@@ -355,6 +487,124 @@ contract SuperSponsorshipPaymasterTest is Helpers {
             )
         );
         paymaster.withdrawStrategyFunds(strategy1, recipient, 1 ether);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                WITHDRAW AS PRIMARY MANAGER TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_WithdrawAsManager_PrimaryManagerReclaims() public {
+        aggregator.setMainManager(manager, strategy1, true);
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 5 ether }(strategy1);
+
+        uint256 managerBefore = manager.balance;
+
+        vm.prank(manager);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 3 ether);
+
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 2 ether, "budget debited");
+        assertEq(paymaster.totalAllocated(), 2 ether, "totalAllocated debited");
+        assertEq(manager.balance - managerBefore, 3 ether, "funds go to the manager");
+    }
+
+    function test_WithdrawAsManager_FullBalance_CloseShop() public {
+        aggregator.setMainManager(manager, strategy1, true);
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 5 ether }(strategy1);
+
+        vm.prank(manager);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 5 ether);
+
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 0);
+        assertEq(paymaster.totalAllocated(), 0);
+    }
+
+    function test_WithdrawAsManager_EmitsEvent() public {
+        aggregator.setMainManager(manager, strategy1, true);
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 5 ether }(strategy1);
+
+        vm.expectEmit(true, true, false, true);
+        emit ISuperSponsorshipPaymaster.StrategyWithdrawnByManager(strategy1, manager, 3 ether);
+
+        vm.prank(manager);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 3 ether);
+    }
+
+    /// @notice A funder/donor is NOT the primary manager, so cannot reclaim — matches the permissionless
+    ///         funding model (funds exit only to the strategy's primary manager).
+    function test_WithdrawAsManager_RevertsNonManager() public {
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 5 ether }(strategy1);
+
+        vm.prank(randomUser);
+        vm.expectRevert(ISuperSponsorshipPaymaster.NOT_PRIMARY_MANAGER.selector);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 1 ether);
+    }
+
+    /// @notice Being the primary manager of strategy1 does not authorize draining strategy2's budget.
+    function test_WithdrawAsManager_RevertsManagerOfDifferentStrategy() public {
+        aggregator.setMainManager(manager, strategy1, true);
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 5 ether }(strategy2);
+
+        vm.prank(manager);
+        vm.expectRevert(ISuperSponsorshipPaymaster.NOT_PRIMARY_MANAGER.selector);
+        paymaster.withdrawStrategyFundsAsManager(strategy2, 1 ether);
+    }
+
+    function test_WithdrawAsManager_RevertsExceedsBalance() public {
+        aggregator.setMainManager(manager, strategy1, true);
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+
+        vm.prank(manager);
+        vm.expectRevert(ISuperSponsorshipPaymaster.WITHDRAW_EXCEEDS_BALANCE.selector);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 2 ether);
+    }
+
+    function test_WithdrawAsManager_RevertsZeroAmount() public {
+        aggregator.setMainManager(manager, strategy1, true);
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+
+        vm.prank(manager);
+        vm.expectRevert(ISuperSponsorshipPaymaster.ZERO_AMOUNT.selector);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 0);
+    }
+
+    function test_WithdrawAsManager_RevertsZeroStrategy() public {
+        vm.prank(manager);
+        vm.expectRevert(ISuperSponsorshipPaymaster.ZERO_ADDRESS.selector);
+        paymaster.withdrawStrategyFundsAsManager(address(0), 1 ether);
+    }
+
+    /// @notice The reconcile() freeze (globalPaused) must halt the untrusted manager exit too, so a manager
+    ///         cannot realize an inflated recorded balance during a deposit/accounting desync.
+    function test_WithdrawAsManager_RevertsWhenGlobalPaused() public {
+        aggregator.setMainManager(manager, strategy1, true);
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 5 ether }(strategy1);
+
+        vm.prank(admin);
+        paymaster.setGlobalPause(true);
+
+        vm.prank(manager);
+        vm.expectRevert(ISuperSponsorshipPaymaster.GLOBAL_PAUSED.selector);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 1 ether);
+    }
+
+    function test_WithdrawAsManager_RevertsInsufficientEntryPointDeposit() public {
+        aggregator.setMainManager(manager, strategy1, true);
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 5 ether }(strategy1);
+
+        mockEntryPoint.setDeposit(address(paymaster), 2 ether);
+
+        vm.prank(manager);
+        vm.expectRevert(ISuperSponsorshipPaymaster.INSUFFICIENT_ENTRYPOINT_DEPOSIT.selector);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 3 ether);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1692,7 +1942,11 @@ contract SuperSponsorshipPaymasterTest is Helpers {
         assertEq(vd, 0);
     }
 
+    /// @dev fundStrategy is permissionless, so the role's gate is exercised on withdrawal instead.
     function test_RevokeRolePreventsAccess() public {
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+
         vm.prank(admin);
         paymaster.revokeRole(FUNDING_ROLE, funder);
 
@@ -1700,7 +1954,7 @@ contract SuperSponsorshipPaymasterTest is Helpers {
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, funder, FUNDING_ROLE)
         );
-        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+        paymaster.withdrawStrategyFunds(strategy1, funder, 1 ether);
     }
 
     function test_RevokeManagerRolePreventsManagement() public {
@@ -2287,6 +2541,531 @@ contract SuperSponsorshipPaymasterTest is Helpers {
         vm.prank(randomUser);
         vm.expectRevert();
         paymaster.setAllowedSender(strategy1, makeAddr("executor"));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+          PERMISSIONLESS FUNDING: WHO CAN, WHAT HAPPENS, WHAT CANNOT
+    //////////////////////////////////////////////////////////////*/
+
+    bytes32 internal constant SIG_SENDER_SET = keccak256("AllowedSenderSet(address,address)");
+    bytes32 internal constant SIG_FUNDED = keccak256("StrategyFunded(address,uint256)");
+
+    /// @dev Pure, so it can appear in an argument position after vm.prank/expectRevert without
+    ///      consuming them. An external view call there consumes the prank, and the call under
+    ///      test then runs unpranked. Pinned to the contract constant in
+    ///      test_PF_DefaultSenderIsTheCanonicalExecutor.
+    function _default() internal pure returns (address) {
+        return 0x183e3171EEf801cE2A29FD48B3b21188f241875d;
+    }
+
+    function _fresh(string memory label) internal returns (address s) {
+        s = makeAddr(label);
+        assertFalse(paymaster.senderInitialized(s), "fresh strategy must be unconfigured");
+    }
+
+    function _opFrom(address strategy, address sender) internal view returns (PackedUserOperation memory) {
+        return _createUserOpWithSenderAndGas(strategy, sender, 150_000);
+    }
+
+    /// @notice Any address can fund any strategy with any positive amount.
+    function testFuzz_PF_AnyAddressCanFund(address who, uint96 amount) public {
+        vm.assume(who > address(0xff) && who != address(paymaster) && who != address(mockEntryPoint));
+        amount = uint96(bound(amount, 1, 1000 ether));
+        address s = _fresh("fuzzFresh");
+        vm.deal(who, amount);
+
+        vm.prank(who);
+        paymaster.fundStrategy{ value: amount }(s);
+
+        assertEq(paymaster.getStrategyBudget(s).balance, amount);
+        assertEq(paymaster.totalAllocated(), amount);
+        assertEq(mockEntryPoint.balanceOf(address(paymaster)), amount, "every wei lands in the EntryPoint deposit");
+    }
+
+    /// @notice A contract can fund: a Safe, a vault factory, a keeper.
+    function test_PF_ContractCanFund() public {
+        FunderContract f = new FunderContract();
+        address s = _fresh("viaContract");
+        vm.deal(address(this), 1 ether);
+
+        f.fund{ value: 1 ether }(paymaster, s);
+
+        assertEq(paymaster.getStrategyBudget(s).balance, 1 ether);
+        assertEq(paymaster.allowedSender(s), _default());
+    }
+
+    function test_PF_ZeroAmountRejectedForAnyone() public {
+        vm.prank(randomUser);
+        vm.expectRevert(ISuperSponsorshipPaymaster.ZERO_AMOUNT.selector);
+        paymaster.fundStrategy{ value: 0 }(strategy1);
+    }
+
+    function test_PF_ZeroStrategyRejectedForAnyone() public {
+        vm.prank(randomUser);
+        vm.expectRevert(ISuperSponsorshipPaymaster.ZERO_ADDRESS.selector);
+        paymaster.fundStrategy{ value: 1 ether }(address(0));
+    }
+
+    /// @notice Dust from many funders accumulates exactly; no rounding, no minimum.
+    function test_PF_ManyDustFundingsAccumulateExactly() public {
+        address s = _fresh("dust");
+        for (uint256 i = 1; i <= 50; ++i) {
+            address who = address(uint160(0x10000 + i));
+            vm.deal(who, 1);
+            vm.prank(who);
+            paymaster.fundStrategy{ value: 1 }(s);
+        }
+        assertEq(paymaster.getStrategyBudget(s).balance, 50);
+        assertEq(paymaster.totalAllocated(), 50);
+        assertEq(mockEntryPoint.balanceOf(address(paymaster)), 50);
+    }
+
+    /// @notice Funding moves deposit and allocation together, so the unallocated pool is untouched.
+    function test_PF_FundingDoesNotChangeUnallocatedBalance() public {
+        mockEntryPoint.setDeposit(address(paymaster), 3 ether); // unallocated 3
+        assertEq(paymaster.unallocatedBalance(), 3 ether);
+
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+
+        assertEq(paymaster.unallocatedBalance(), 3 ether, "still 3: deposit +1, allocated +1");
+    }
+
+    /// @notice A stranger's ETH is spendable only by the allowed sender, through the full
+    ///         validate/postOp cycle, and a non-sender is rejected for that same strategy.
+    function test_PF_StrangerFundsAreSpendableOnlyByAllowedSender() public {
+        address s = _fresh("spend");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 2 ether }(s);
+
+        vm.prank(address(mockEntryPoint));
+        vm.expectRevert(ISuperSponsorshipPaymaster.UNAUTHORIZED_SENDER.selector);
+        paymaster.validatePaymasterUserOp(_opFrom(s, address(0xBAD)), bytes32(0), 1 ether);
+
+        vm.prank(address(mockEntryPoint));
+        (bytes memory ctx,) =
+            paymaster.validatePaymasterUserOp(_opFrom(s, _default()), bytes32(0), 1 ether);
+        vm.prank(address(mockEntryPoint));
+        paymaster.postOp(IPaymaster.PostOpMode.opSucceeded, ctx, 0.25 ether, 0);
+
+        ISuperSponsorshipPaymaster.StrategyBudget memory b = paymaster.getStrategyBudget(s);
+        assertEq(b.balance, 2 ether - 0.25 ether, "debited the actual cost, refunded the rest");
+        assertEq(b.totalDebited, 0.25 ether);
+    }
+
+    /// @notice Donation semantics: FUNDING_ROLE can withdraw what a stranger sent.
+    function test_PF_FundingRoleCanWithdrawAStrangersDonation() public {
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+
+        uint256 before = recipient.balance;
+        vm.prank(funder);
+        paymaster.withdrawStrategyFunds(strategy1, recipient, 1 ether);
+
+        assertEq(recipient.balance - before, 1 ether);
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 0);
+    }
+
+    function test_PF_StrangerCannotCredit() public {
+        mockEntryPoint.setDeposit(address(paymaster), 1 ether);
+        vm.prank(randomUser);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, randomUser, FUNDING_ROLE)
+        );
+        paymaster.creditStrategy(strategy1, 1 ether);
+    }
+
+    /// @notice On a first funding the sender event precedes the funding event, exactly once each.
+    function test_PF_EventOrderOnFirstFunding() public {
+        address s = _fresh("events");
+        vm.recordLogs();
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(s);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 senderIdx = type(uint256).max;
+        uint256 fundedIdx = type(uint256).max;
+        uint256 senderCount;
+        uint256 fundedCount;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(paymaster)) continue;
+            if (logs[i].topics[0] == SIG_SENDER_SET) {
+                senderIdx = i;
+                senderCount++;
+            }
+            if (logs[i].topics[0] == SIG_FUNDED) {
+                fundedIdx = i;
+                fundedCount++;
+            }
+        }
+        assertEq(senderCount, 1);
+        assertEq(fundedCount, 1);
+        assertLt(senderIdx, fundedIdx, "sender is configured before the funding is announced");
+    }
+
+    /// @notice Funding a paused strategy is accepted (accounting) but not spendable until unpaused.
+    function test_PF_FundingAPausedStrategyIsAcceptedButNotSpendable() public {
+        vm.prank(manager);
+        paymaster.pauseStrategy(strategy1);
+
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 1 ether);
+
+        vm.prank(address(mockEntryPoint));
+        vm.expectRevert(ISuperSponsorshipPaymaster.STRATEGY_PAUSED.selector);
+        paymaster.validatePaymasterUserOp(_createUserOp(strategy1), bytes32(0), 0.1 ether);
+
+        vm.prank(manager);
+        paymaster.unpauseStrategy(strategy1);
+        _validateOp(strategy1, 0.1 ether);
+    }
+
+    /// @notice Funding under a global pause is accepted; it cannot lift the pause.
+    function test_PF_FundingUnderGlobalPauseIsAcceptedButCannotUnpause() public {
+        vm.prank(admin);
+        paymaster.setGlobalPause(true);
+
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+
+        assertTrue(paymaster.globalPaused());
+        vm.prank(address(mockEntryPoint));
+        vm.expectRevert(ISuperSponsorshipPaymaster.GLOBAL_PAUSED.selector);
+        paymaster.validatePaymasterUserOp(_createUserOp(strategy1), bytes32(0), 0.1 ether);
+    }
+
+    /// @notice Pins the default to the canonical executor address, identical on every chain.
+    function test_PF_DefaultSenderIsTheCanonicalExecutor() public {
+        address s = _fresh("pin");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 }(s);
+        assertEq(paymaster.allowedSender(s), 0x183e3171EEf801cE2A29FD48B3b21188f241875d);
+        assertEq(paymaster.DEFAULT_ALLOWED_SENDER(), _default(), "test accessor pinned to the contract constant");
+    }
+
+    /// @notice A block set before any funding survives the funding.
+    function test_PF_ZeroSetBeforeFirstFunding_StaysZero() public {
+        address s = _fresh("preBlocked");
+        vm.prank(manager);
+        paymaster.setAllowedSender(s, address(0));
+        assertTrue(paymaster.senderInitialized(s), "explicit zero counts as configured");
+
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(s);
+
+        assertEq(paymaster.allowedSender(s), address(0));
+        vm.prank(address(mockEntryPoint));
+        vm.expectRevert(ISuperSponsorshipPaymaster.UNAUTHORIZED_SENDER.selector);
+        paymaster.validatePaymasterUserOp(_opFrom(s, _default()), bytes32(0), 0.1 ether);
+    }
+
+    /// @notice The manager can still move the sender after the default was applied.
+    function test_PF_ManagerCanOverrideAfterDefaultApplied() public {
+        address s = _fresh("override");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(s);
+
+        vm.prank(manager);
+        paymaster.setAllowedSender(s, address(0xACC));
+
+        vm.prank(address(mockEntryPoint));
+        vm.expectRevert(ISuperSponsorshipPaymaster.UNAUTHORIZED_SENDER.selector);
+        paymaster.validatePaymasterUserOp(_opFrom(s, _default()), bytes32(0), 0.1 ether);
+        vm.prank(address(mockEntryPoint));
+        paymaster.validatePaymasterUserOp(_opFrom(s, address(0xACC)), bytes32(0), 0.1 ether);
+    }
+
+    /// @notice The manager can block after the default was applied, and more funding cannot undo it.
+    function test_PF_ManagerCanBlockAfterDefaultApplied_FundingCannotUndo() public {
+        address s = _fresh("lateBlock");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(s);
+        vm.prank(manager);
+        paymaster.setAllowedSender(s, address(0));
+
+        for (uint256 i; i < 3; ++i) {
+            address who = address(uint160(0x20000 + i));
+            vm.deal(who, 1 ether);
+            vm.prank(who);
+            paymaster.fundStrategy{ value: 1 wei }(s);
+        }
+        assertEq(paymaster.allowedSender(s), address(0), "blocked stays blocked");
+    }
+
+    /// @notice creditStrategy applies the same first-configuration rule as fundStrategy.
+    function test_PF_CreditStrategy_AppliesDefaultOnFirstConfiguration() public {
+        address s = _fresh("credited");
+        mockEntryPoint.setDeposit(address(paymaster), 2 ether);
+
+        vm.expectEmit(true, true, false, false);
+        emit ISuperSponsorshipPaymaster.AllowedSenderSet(s, _default());
+        vm.prank(funder);
+        paymaster.creditStrategy(s, 1 ether);
+
+        assertTrue(paymaster.senderInitialized(s));
+        assertEq(paymaster.allowedSender(s), _default());
+    }
+
+    function test_PF_CreditStrategy_DoesNotOverrideManagerSender() public {
+        mockEntryPoint.setDeposit(address(paymaster), 2 ether);
+        vm.prank(funder);
+        paymaster.creditStrategy(strategy1, 1 ether); // strategy1 set to 0xACC in setUp
+        assertEq(paymaster.allowedSender(strategy1), address(0xACC));
+    }
+
+    function test_PF_CreditAfterFund_NoSecondSenderEvent() public {
+        address s = _fresh("fundThenCredit");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(s);
+        mockEntryPoint.setDeposit(address(paymaster), 5 ether);
+
+        vm.recordLogs();
+        vm.prank(funder);
+        paymaster.creditStrategy(s, 1 ether);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != SIG_SENDER_SET, "already configured: no sender event");
+        }
+    }
+
+    /// @notice Initialization is per strategy.
+    function test_PF_TwoStrategiesInitializeIndependently() public {
+        address a = _fresh("indepA");
+        address b = _fresh("indepB");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(a);
+
+        assertTrue(paymaster.senderInitialized(a));
+        assertFalse(paymaster.senderInitialized(b));
+        assertEq(paymaster.allowedSender(b), address(0));
+    }
+
+    /// @notice Strategy isolation holds on a stranger-funded budget: the calldata strategy must
+    ///         match the paymaster-data strategy.
+    function test_PF_StrangerFundedBudgetCannotBeSpentByAnotherStrategysOp() public {
+        address a = _fresh("isoA");
+        address b = _fresh("isoB");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(a);
+
+        PackedUserOperation memory op =
+            _createUserOpFull(a, _default(), 150_000, _validCallData(b));
+        vm.prank(address(mockEntryPoint));
+        vm.expectRevert(ISuperSponsorshipPaymaster.INVALID_CALLDATA.selector);
+        paymaster.validatePaymasterUserOp(op, bytes32(0), 0.1 ether);
+    }
+
+    /// @notice Draining a budget does not reset its configuration; refunding it later is silent.
+    function test_PF_WithdrawAllThenFundAgain_ConfigurationPersists() public {
+        address s = _fresh("drain");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(s);
+        vm.prank(funder);
+        paymaster.withdrawStrategyFunds(s, recipient, 1 ether);
+        assertEq(paymaster.getStrategyBudget(s).balance, 0);
+
+        address another = makeAddr("anotherFunder");
+        vm.deal(another, 1 ether);
+        vm.recordLogs();
+        vm.prank(another);
+        paymaster.fundStrategy{ value: 1 ether }(s);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != SIG_SENDER_SET);
+        }
+        assertEq(paymaster.allowedSender(s), _default());
+    }
+
+    /// @notice Permissionless funding never creates drift, so reconcile finds nothing to do.
+    function test_PF_ReconcileSeesNoDriftAfterStrangerFunding() public {
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+        vm.prank(admin);
+        paymaster.reconcile();
+        assertFalse(paymaster.globalPaused(), "no drift, no auto-pause");
+        assertEq(paymaster.totalAllocated(), 1 ether);
+    }
+
+    function test_PF_VersionBumpedForTheNewBehaviour() public view {
+        assertEq(paymaster.VERSION(), 7);
+    }
+
+    /// @notice Funding grants nothing.
+    function test_PF_FundingGrantsNoRole() public {
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+        assertFalse(paymaster.hasRole(FUNDING_ROLE, randomUser));
+        assertFalse(paymaster.hasRole(MANAGER_ROLE, randomUser));
+        assertFalse(paymaster.hasRole(paymaster.DEFAULT_ADMIN_ROLE(), randomUser));
+    }
+
+    /// @notice A revoked funder can still fund (anyone can) but can no longer withdraw.
+    function test_PF_RevokedFunderCanStillFundButNotWithdraw() public {
+        vm.prank(admin);
+        paymaster.revokeRole(FUNDING_ROLE, funder);
+
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 1 ether }(strategy1);
+
+        vm.prank(funder);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, funder, FUNDING_ROLE)
+        );
+        paymaster.withdrawStrategyFunds(strategy1, funder, 1 ether);
+    }
+
+    /// @notice After accounting drift and reconcile, the paymaster is globally paused.
+    ///         A stranger's funding is accepted into the accounting but does not lift the pause.
+    function test_PF_FundingAfterDrift_DoesNotLiftTheAutoPause() public {
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 2 ether }(strategy1);
+        // Drift from outside the contract's own accounting (emergencyWithdraw keeps the two in
+        // step by design): the EntryPoint deposit drops below what is allocated.
+        mockEntryPoint.setDeposit(address(paymaster), 1 ether); // deposit 1, allocated 2
+        vm.prank(admin);
+        paymaster.reconcile();
+        assertTrue(paymaster.globalPaused());
+        uint256 allocatedAfterReconcile = paymaster.totalAllocated();
+
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 0.5 ether }(strategy1);
+
+        assertTrue(paymaster.globalPaused(), "funding is not an unpause");
+        assertEq(paymaster.totalAllocated(), allocatedAfterReconcile + 0.5 ether);
+        assertGe(mockEntryPoint.balanceOf(address(paymaster)), paymaster.totalAllocated(), "deposit covers allocation again");
+    }
+
+    /// @notice Plain ETH sent to the contract is not funding: no budget, no deposit, no sender.
+    function test_PF_PlainTransferIsNotFunding() public {
+        address s = _fresh("plain");
+        uint256 depositBefore = mockEntryPoint.balanceOf(address(paymaster));
+        vm.prank(randomUser);
+        (bool ok,) = address(paymaster).call{ value: 1 ether }("");
+        assertTrue(ok);
+
+        assertEq(paymaster.getStrategyBudget(s).balance, 0);
+        assertEq(mockEntryPoint.balanceOf(address(paymaster)), depositBefore);
+        assertFalse(paymaster.senderInitialized(s));
+        assertEq(address(paymaster).balance, 1 ether, "sits on the contract, for sweepETH");
+    }
+
+    /// @notice The per-strategy cap set by a manager applies to a stranger-funded budget.
+    function test_PF_SingleOpCapAppliesToStrangerFundedBudget() public {
+        address s = _fresh("capped");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 5 ether }(s);
+        vm.prank(manager);
+        paymaster.setMaxSingleOpCost(s, 0.5 ether);
+
+        vm.prank(address(mockEntryPoint));
+        vm.expectRevert(ISuperSponsorshipPaymaster.EXCEEDS_SINGLE_OP_CAP.selector);
+        paymaster.validatePaymasterUserOp(_opFrom(s, _default()), bytes32(0), 1 ether);
+    }
+
+    /// @notice The post-op refund lands back in the stranger-funded budget.
+    function test_PF_PostOpRefundReturnsToStrangerFundedBudget() public {
+        address s = _fresh("refund");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 ether }(s);
+
+        vm.prank(address(mockEntryPoint));
+        (bytes memory ctx,) =
+            paymaster.validatePaymasterUserOp(_opFrom(s, _default()), bytes32(0), 0.8 ether);
+        assertEq(paymaster.getStrategyBudget(s).balance, 0.2 ether, "pre-charged");
+        vm.prank(address(mockEntryPoint));
+        paymaster.postOp(IPaymaster.PostOpMode.opSucceeded, ctx, 0.1 ether, 0);
+        assertEq(paymaster.getStrategyBudget(s).balance, 0.9 ether, "refunded 0.7");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                MODEL-BASED FUZZ: THE SENDER STATE MACHINE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Interleave funding, crediting and manager writes in random order; the sender must
+    ///         always equal the model: explicit value if the manager ever wrote, else the default
+    ///         if ever funded/credited, else zero.
+    function testFuzz_PF_InterleavedWrites_SenderMatchesModel(uint256 seed, uint8 steps) public {
+        steps = uint8(bound(steps, 1, 24));
+        address s = _fresh("model");
+        mockEntryPoint.setDeposit(address(paymaster), 100 ether); // unallocated pool for credits
+
+        bool initialized;
+        bool explicitSet;
+        address explicitValue;
+        address[4] memory choices = [address(0), address(0xACC), _default(), makeAddr("x")];
+
+        for (uint256 i; i < steps; ++i) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            uint256 action = r % 3;
+            if (action == 0) {
+                address who = address(uint160(0x30000 + (r >> 8) % 1000));
+                uint256 amt = 1 + (r >> 32) % 1 ether;
+                vm.deal(who, amt);
+                vm.prank(who);
+                paymaster.fundStrategy{ value: amt }(s);
+                initialized = true;
+            } else if (action == 1) {
+                uint256 amt = 1 + (r >> 32) % 0.01 ether;
+                vm.prank(funder);
+                paymaster.creditStrategy(s, amt);
+                initialized = true;
+            } else {
+                address v = choices[(r >> 16) % 4];
+                vm.prank(manager);
+                paymaster.setAllowedSender(s, v);
+                initialized = true;
+                explicitSet = true;
+                explicitValue = v;
+            }
+
+            address expected = explicitSet ? explicitValue : (initialized ? _default() : address(0));
+            assertEq(paymaster.senderInitialized(s), initialized, "flag matches model");
+            assertEq(paymaster.allowedSender(s), expected, "sender matches model");
+        }
+    }
+
+    /// @notice Accounting identity under random funds and role withdrawals.
+    function testFuzz_PF_AccountingIdentity(uint96[4] memory amounts, uint96 withdrawSeed) public {
+        address s = _fresh("acct");
+        uint256 total;
+        for (uint256 i; i < 4; ++i) {
+            uint256 amt = bound(uint256(amounts[i]), 1, 100 ether);
+            address who = address(uint160(0x40000 + i));
+            vm.deal(who, amt);
+            vm.prank(who);
+            paymaster.fundStrategy{ value: amt }(s);
+            total += amt;
+        }
+        uint256 w = bound(uint256(withdrawSeed), 0, total);
+        if (w > 0) {
+            vm.prank(funder);
+            paymaster.withdrawStrategyFunds(s, recipient, w);
+        }
+        assertEq(paymaster.getStrategyBudget(s).balance, total - w);
+        assertEq(paymaster.totalAllocated(), total - w);
+        assertEq(mockEntryPoint.balanceOf(address(paymaster)), total - w);
+        assertEq(paymaster.unallocatedBalance(), 0);
+    }
+
+    /// @notice Once initialized, never un-initialized, whatever happens next.
+    function testFuzz_PF_InitializedIsMonotonic(uint256 seed) public {
+        address s = _fresh("mono");
+        vm.prank(randomUser);
+        paymaster.fundStrategy{ value: 1 }(s);
+        assertTrue(paymaster.senderInitialized(s));
+
+        for (uint256 i; i < 6; ++i) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i)));
+            if (r % 2 == 0) {
+                vm.prank(manager);
+                paymaster.setAllowedSender(s, r % 4 == 0 ? address(0) : address(uint160(r)));
+            } else if (paymaster.getStrategyBudget(s).balance > 0) {
+                vm.prank(funder);
+                paymaster.withdrawStrategyFunds(s, recipient, 1);
+            }
+            assertTrue(paymaster.senderInitialized(s), "monotonic");
+        }
     }
 
     /*//////////////////////////////////////////////////////////////

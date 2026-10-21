@@ -12,6 +12,7 @@ import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import { SuperSponsorshipPaymaster } from "../../../src/paymaster/SuperSponsorshipPaymaster.sol";
 import { ISuperSponsorshipPaymaster } from "../../../src/interfaces/ISuperSponsorshipPaymaster.sol";
+import { MockSuperVaultAggregator } from "../../mocks/MockSuperVaultAggregator.sol";
 
 /// @title MockSimpleAccount
 /// @notice Minimal ERC-4337 account that validates any UserOp signed by its owner
@@ -66,6 +67,7 @@ contract SuperSponsorshipPaymasterForkTest is Test {
 
     IEntryPoint public entryPoint;
     SuperSponsorshipPaymaster public paymaster;
+    MockSuperVaultAggregator public aggregator;
     MockSimpleAccount public account;
 
     address public admin;
@@ -96,8 +98,9 @@ contract SuperSponsorshipPaymasterForkTest is Test {
 
         (accountOwner, accountOwnerKey) = makeAddrAndKey("accountOwner");
 
-        // Deploy paymaster
-        paymaster = new SuperSponsorshipPaymaster(entryPoint, admin);
+        // Deploy paymaster (with a controllable aggregator for the manager-withdraw path)
+        aggregator = new MockSuperVaultAggregator();
+        paymaster = new SuperSponsorshipPaymaster(entryPoint, admin, address(aggregator));
 
         // Grant roles
         vm.startPrank(admin);
@@ -654,6 +657,198 @@ contract SuperSponsorshipPaymasterForkTest is Test {
         IEntryPoint.DepositInfo memory info = entryPoint.getDepositInfo(address(paymaster));
         assertEq(info.stake, 1 ether);
         assertTrue(info.staked);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+            PERMISSIONLESS FUNDING ON THE REAL ENTRYPOINT
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice The default sender is the live executor on mainnet: the constant points at code.
+    function test_Fork_PF_DefaultSenderIsTheLiveExecutor() public view {
+        address d = paymaster.DEFAULT_ALLOWED_SENDER();
+        assertEq(d, REAL_EXECUTOR);
+        assertGt(d.code.length, 0, "default sender must be a deployed contract on mainnet");
+    }
+
+    /// @notice A stranger funds a fresh strategy on the real EntryPoint; the deposit moves and the
+    ///         sender defaults to the live executor with no manager transaction.
+    function test_Fork_PF_StrangerFundsFreshStrategy_RealDepositAndDefaultSender() public {
+        address fresh = makeAddr("freshStrategy");
+        address stranger = makeAddr("stranger");
+        vm.deal(stranger, 3 ether);
+        uint256 depositBefore = entryPoint.balanceOf(address(paymaster));
+
+        vm.prank(stranger);
+        paymaster.fundStrategy{ value: 3 ether }(fresh);
+
+        assertEq(entryPoint.balanceOf(address(paymaster)) - depositBefore, 3 ether, "real EntryPoint deposit");
+        assertEq(paymaster.getStrategyBudget(fresh).balance, 3 ether);
+        assertEq(paymaster.allowedSender(fresh), REAL_EXECUTOR);
+        assertTrue(paymaster.senderInitialized(fresh));
+    }
+
+    /// @notice End to end: a stranger funds, the manager points the sender at our account, and
+    ///         handleOps sponsors the op from that budget. Funding by anyone, control by the manager.
+    function test_Fork_PF_E2E_StrangerFunded_ManagerOverride_HandleOpsSponsors() public {
+        address fresh = makeAddr("freshStrategy");
+        address stranger = makeAddr("stranger");
+        vm.deal(stranger, 5 ether);
+        vm.prank(stranger);
+        paymaster.fundStrategy{ value: 5 ether }(fresh);
+
+        vm.prank(manager);
+        paymaster.setAllowedSender(fresh, address(account));
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _buildUserOp(fresh);
+        uint256 bundlerBefore = bundler.balance;
+
+        vm.prank(bundler);
+        entryPoint.handleOps(ops, payable(bundler));
+
+        ISuperSponsorshipPaymaster.StrategyBudget memory b = paymaster.getStrategyBudget(fresh);
+        assertLt(b.balance, 5 ether, "gas was debited from the stranger's donation");
+        assertGt(b.totalDebited, 0);
+        assertGt(bundler.balance, bundlerBefore, "bundler was paid from the paymaster deposit");
+    }
+
+    /// @notice A strategy the manager blocked stays blocked on the real EntryPoint even after a
+    ///         stranger sends 1 wei: handleOps reverts and the sender is still zero.
+    function test_Fork_PF_E2E_StrangerCannotReArmBlockedStrategy() public {
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 2 ether }(strategy1);
+        vm.prank(manager);
+        paymaster.setAllowedSender(strategy1, address(0)); // the block
+
+        address stranger = makeAddr("stranger");
+        vm.deal(stranger, 1 ether);
+        vm.prank(stranger);
+        paymaster.fundStrategy{ value: 1 wei }(strategy1);
+        assertEq(paymaster.allowedSender(strategy1), address(0), "still blocked");
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _buildUserOp(strategy1);
+        vm.prank(bundler);
+        vm.expectRevert();
+        entryPoint.handleOps(ops, payable(bundler));
+
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 2 ether + 1 wei, "nothing spent");
+    }
+
+    /// @notice The funding role withdraws a stranger's donation from the real EntryPoint.
+    function test_Fork_PF_FundingRoleWithdrawsDonationFromRealEntryPoint() public {
+        address stranger = makeAddr("stranger");
+        address recipient = makeAddr("recipient");
+        vm.deal(stranger, 2 ether);
+        vm.prank(stranger);
+        paymaster.fundStrategy{ value: 2 ether }(strategy1);
+
+        vm.prank(funder);
+        paymaster.withdrawStrategyFunds(strategy1, recipient, 2 ether);
+
+        assertEq(recipient.balance, 2 ether);
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 0);
+    }
+
+    /// @notice A stranger cannot withdraw their own donation from the real EntryPoint.
+    function test_Fork_PF_StrangerCannotWithdrawOwnDonation() public {
+        address stranger = makeAddr("stranger");
+        vm.deal(stranger, 2 ether);
+        vm.prank(stranger);
+        paymaster.fundStrategy{ value: 2 ether }(strategy1);
+
+        vm.prank(stranger);
+        vm.expectRevert();
+        paymaster.withdrawStrategyFunds(strategy1, stranger, 2 ether);
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 2 ether);
+    }
+
+    /// @notice E2E: a stranger funds a strategy, then the strategy's primary manager reclaims the remaining
+    ///         budget from the REAL EntryPoint — the "close shop" path, no FUNDING_ROLE needed.
+    function test_Fork_PF_E2E_PrimaryManagerReclaimsFromRealEntryPoint() public {
+        address stranger = makeAddr("stranger");
+        vm.deal(stranger, 3 ether);
+        vm.prank(stranger);
+        paymaster.fundStrategy{ value: 3 ether }(strategy1);
+
+        aggregator.setMainManager(manager, strategy1, true);
+
+        uint256 depositBefore = entryPoint.balanceOf(address(paymaster));
+        uint256 managerBefore = manager.balance;
+
+        vm.prank(manager);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 3 ether);
+
+        assertEq(manager.balance - managerBefore, 3 ether, "manager received the real ETH");
+        assertEq(depositBefore - entryPoint.balanceOf(address(paymaster)), 3 ether, "EntryPoint deposit drawn down");
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 0, "budget emptied");
+        assertEq(paymaster.totalAllocated(), 0, "totalAllocated cleared");
+    }
+
+    /// @notice E2E: a sponsored op spends part of the budget, then the manager reclaims only the remainder.
+    function test_Fork_PF_E2E_ManagerReclaimsRemainderAfterSponsoredOp() public {
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 3 ether }(strategy1);
+        aggregator.setMainManager(manager, strategy1, true);
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _buildUserOp(strategy1);
+        vm.prank(bundler);
+        entryPoint.handleOps(ops, payable(bundler));
+
+        uint256 remaining = paymaster.getStrategyBudget(strategy1).balance;
+        assertLt(remaining, 3 ether, "op consumed some budget");
+
+        // Post-op accounting can drift the internal balance slightly above the real EntryPoint deposit
+        // (the same reason withdrawStrategyFunds caps at balanceOf); reclaim what the deposit actually holds.
+        uint256 avail = entryPoint.balanceOf(address(paymaster));
+        uint256 amount = remaining < avail ? remaining : avail;
+        assertGt(amount, 0, "something reclaimable");
+
+        uint256 managerBefore = manager.balance;
+        vm.prank(manager);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, amount);
+
+        assertEq(manager.balance - managerBefore, amount, "manager reclaimed the available remainder");
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, remaining - amount, "budget reduced by reclaimed amount");
+    }
+
+    /// @notice A non-manager (here the funder, who lacks primary-manager status) cannot use the manager path.
+    function test_Fork_PF_E2E_NonManagerCannotReclaim() public {
+        vm.prank(funder);
+        paymaster.fundStrategy{ value: 2 ether }(strategy1);
+        // manager status is NOT set for `funder`
+
+        vm.prank(funder);
+        vm.expectRevert(ISuperSponsorshipPaymaster.NOT_PRIMARY_MANAGER.selector);
+        paymaster.withdrawStrategyFundsAsManager(strategy1, 2 ether);
+        assertEq(paymaster.getStrategyBudget(strategy1).balance, 2 ether, "budget untouched");
+    }
+
+    /// @notice Two strangers, two fresh strategies, two sponsored ops: budgets stay isolated.
+    function test_Fork_PF_E2E_TwoStrangerFundedStrategiesStayIsolated() public {
+        address a = makeAddr("freshA");
+        address b = makeAddr("freshB");
+        address s1 = makeAddr("stranger1");
+        address s2 = makeAddr("stranger2");
+        vm.deal(s1, 2 ether);
+        vm.deal(s2, 2 ether);
+        vm.prank(s1);
+        paymaster.fundStrategy{ value: 2 ether }(a);
+        vm.prank(s2);
+        paymaster.fundStrategy{ value: 2 ether }(b);
+        vm.startPrank(manager);
+        paymaster.setAllowedSender(a, address(account));
+        paymaster.setAllowedSender(b, address(account));
+        vm.stopPrank();
+
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = _buildUserOp(a);
+        vm.prank(bundler);
+        entryPoint.handleOps(ops, payable(bundler));
+
+        assertLt(paymaster.getStrategyBudget(a).balance, 2 ether, "A paid");
+        assertEq(paymaster.getStrategyBudget(b).balance, 2 ether, "B untouched");
     }
 
     /*//////////////////////////////////////////////////////////////
