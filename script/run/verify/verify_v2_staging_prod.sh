@@ -721,6 +721,7 @@ get_contract_source() {
         "AaveV4SupplyHookV2") echo "src/hooks/loan/aave-v4/AaveV4SupplyHookV2.sol" ;;
         "AaveV4BorrowHookV2") echo "src/hooks/loan/aave-v4/AaveV4BorrowHookV2.sol" ;;
         "AaveV4WithdrawHookV2") echo "src/hooks/loan/aave-v4/AaveV4WithdrawHookV2.sol" ;;
+        "AaveV4HealthCheckHook") echo "src/hooks/loan/aave-v4/AaveV4HealthCheckHook.sol" ;;
         "AaveV4LendHook") echo "src/hooks/loan/aave-v4/AaveV4LendHook.sol" ;;
         "AaveV4RedeemHook") echo "src/hooks/loan/aave-v4/AaveV4RedeemHook.sol" ;;
 
@@ -767,6 +768,7 @@ get_contract_source() {
         "MorphoLendHook") echo "src/hooks/loan/morpho/MorphoLendHook.sol" ;;
         "MetaMorphoReallocateHook") echo "src/hooks/vaults/metamorpho/MetaMorphoReallocateHook.sol" ;;
         "ForceDeallocateMorphoHook") echo "src/hooks/vaults/metamorpho/ForceDeallocateMorphoHook.sol" ;;
+        "MorphoHealthCheckHook") echo "src/hooks/loan/morpho/MorphoHealthCheckHook.sol" ;;
 
         # Sponsorship
         "SuperSponsorshipPaymaster") echo "src/paymaster/SuperSponsorshipPaymaster.sol" ;;
