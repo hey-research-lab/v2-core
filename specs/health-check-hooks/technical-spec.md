@@ -109,7 +109,7 @@ Not applicable — the guard moves nothing. A compromised oracle degrades it to 
 | Passes post-action in one userOp | fork `*_PledgeBorrow_OneUserOp_Passes` |
 | PASSTHROUGH under the real executor | fork `*_ForwardsBorrowOutput_ToRepay` (wallet nets to zero, ≤ 2 wei dust) |
 | Sizeless S2 | `test_SizingApi_Sizeless`; `HookSizingInterface.t.sol` NewlyS2 lists + `_allHooks` 126 |
-| Identity-only inspect | `test_Inspect_PacksIdentity_ExcludesThreshold` (132 / 104 bytes) |
+| Threshold in the leaf | `test_Inspect_PacksIdentityAndThreshold` (164 / 136 bytes); `test_Leaf_ThresholdDowngrade_FailsOldProof` (old proof fails after a threshold change) |
 
 ### Non-Functional
 - Deployed hooks' bytecode unchanged: `AaveV4LoanBytecodeUnchanged.t.sol` (8 tests) green; regenerating the two new
@@ -124,8 +124,13 @@ Not applicable — the guard moves nothing. A compromised oracle degrades it to 
 - Errors: `HEALTH_FACTOR_BELOW_MINIMUM(uint256,uint256)` (same signature on both), `INVALID_MIN_HEALTH_FACTOR()`,
   `INVALID_DATA_LENGTH()`; Morpho adds `MARKET_KEY_MISMATCH()`, `IDENTICAL_TOKENS()`; Aave reuses
   `AaveV4ReserveKey.MARKET_KEY_MISMATCH`; both reuse `BaseHook.ADDRESS_NOT_VALID`.
-- `inspect()` is `pure`: Morpho packs `(marketKey, loanToken, collateralToken, oracle, irm, lltv)` — byte-identical in
-  shape to the V2 family; Aave packs `(marketKey, spoke, supplyReserveId, borrowReserveId)`.
+- `inspect()` is `pure`: Morpho packs `(marketKey, loanToken, collateralToken, oracle, irm, lltv, minHealthFactor)` —
+  the V2 family identity plus one trailing `uint256`; Aave packs `(marketKey, spoke, supplyReserveId, borrowReserveId,
+  minHealthFactor)`. The threshold is in the leaf on purpose (PR #1037 review F1): `SuperVaultStrategy._validateHook`
+  hashes only `inspect()` output, so without it an execution signer could reuse a strategy permission with a lower
+  minimum. Consequence: each distinct threshold is a distinct leaf, and lowering or raising the curator margin means
+  publishing a new root — the same cost as changing a market or `lltv`. Off-chain leaf builders must append the WAD
+  threshold as a 32-byte word.
 
 ### Deployment Changes
 - `script/utils/Constants.sol`: `MORPHO_HEALTH_CHECK_HOOK_KEY`, `AAVE_V4_HEALTH_CHECK_HOOK_KEY`

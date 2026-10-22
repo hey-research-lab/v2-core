@@ -143,11 +143,15 @@ contract AaveV4HealthCheckHook is BaseHook, ISuperHookInflowOutflow {
     //////////////////////////////////////////////////////////////*/
 
     /// @inheritdoc ISuperHookInspector
-    /// @dev Identity only (market key, spoke, reserve ids) — the threshold is committed through the full
-    ///      calldata regardless and is excluded.
+    /// @dev Identity (market key, spoke, reserve ids) followed by `minHealthFactor` (136 bytes total). The threshold
+    ///      IS part of the leaf: a SuperVault strategy's permission commits to an exact minimum, so an execution
+    ///      signer holding a proof for one margin cannot present it with a lower one. Each distinct threshold is
+    ///      therefore a distinct leaf. The ERC-4337 path commits the full calldata anyway.
     function inspect(bytes calldata data) external pure override returns (bytes memory) {
         Vars memory vars = _decode(data);
-        return abi.encodePacked(vars.marketKey, vars.spoke, vars.supplyReserveId, vars.borrowReserveId);
+        return abi.encodePacked(
+            vars.marketKey, vars.spoke, vars.supplyReserveId, vars.borrowReserveId, vars.minHealthFactor
+        );
     }
 
     /// @inheritdoc ISuperHookInflowOutflow

@@ -170,9 +170,10 @@ contract MorphoHealthCheckHook is BaseHook, ISuperHookInflowOutflow {
     //////////////////////////////////////////////////////////////*/
 
     /// @inheritdoc ISuperHookInspector
-    /// @dev Identity only — the same 132-byte payload the Morpho V2 loan hooks pack, so every Morpho leaf of a
-    ///      strategy shares one identity. The threshold is not identity (it is committed through the full
-    ///      calldata regardless) and is excluded.
+    /// @dev The 132-byte Morpho V2 identity payload (market key + MarketParams) followed by `minHealthFactor`
+    ///      (164 bytes total). The threshold IS part of the leaf: a SuperVault strategy's permission commits to an
+    ///      exact minimum, so an execution signer holding a proof for one margin cannot present it with a lower one.
+    ///      Each distinct threshold is therefore a distinct leaf. The ERC-4337 path commits the full calldata anyway.
     function inspect(bytes calldata data) external pure override returns (bytes memory) {
         Vars memory vars = _decode(data);
         return abi.encodePacked(
@@ -181,7 +182,8 @@ contract MorphoHealthCheckHook is BaseHook, ISuperHookInflowOutflow {
             vars.marketParams.collateralToken,
             vars.marketParams.oracle,
             vars.marketParams.irm,
-            vars.marketParams.lltv
+            vars.marketParams.lltv,
+            vars.minHealthFactor
         );
     }
 

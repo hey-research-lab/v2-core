@@ -5,6 +5,7 @@ pragma solidity 0.8.30;
 import { Helpers } from "../../../utils/Helpers.sol";
 import { Execution } from "modulekit/accounts/erc7579/lib/ExecutionLib.sol";
 import { IERC165 } from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import { MerkleProof } from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
 // Superform
 import { BaseHook } from "../../../../src/hooks/BaseHook.sol";
@@ -275,9 +276,9 @@ contract AaveV4HealthCheckHookTest is Helpers {
                            INSPECT / SIZING API
     //////////////////////////////////////////////////////////////*/
 
-    function test_Inspect_PacksIdentity_ExcludesThreshold() public view {
+    function test_Inspect_PacksIdentityAndThreshold() public view {
         bytes memory out = hook.inspect(_data(WAD));
-        assertEq(out.length, 104, "marketKey + spoke + 2 reserve ids");
+        assertEq(out.length, 136, "marketKey + spoke + 2 reserve ids + minHealthFactor");
         assertEq(
             BytesLib.toAddress(out, 0),
             AaveV4ReserveKey.computeMarketKey(address(spokeA), SUPPLY_RESERVE_ID, BORROW_RESERVE_ID)
@@ -285,8 +286,26 @@ contract AaveV4HealthCheckHookTest is Helpers {
         assertEq(BytesLib.toAddress(out, 20), address(spokeA));
         assertEq(BytesLib.toUint256(out, 40), SUPPLY_RESERVE_ID);
         assertEq(BytesLib.toUint256(out, 72), BORROW_RESERVE_ID);
+        assertEq(BytesLib.toUint256(out, 104), WAD);
 
-        assertEq(keccak256(out), keccak256(hook.inspect(_data(3e18))), "threshold is not identity");
+        assertTrue(keccak256(out) != keccak256(hook.inspect(_data(3e18))), "threshold is identity");
+    }
+
+    /// @dev Regression for PR #1037 F1: the SuperVault leaf (`SuperVaultAggregator._createLeaf` replica) must change
+    ///      when only the threshold changes, so a proof issued for `minHealthFactor = 1.5e18` cannot authorise a
+    ///      downgraded `1e18` check.
+    function test_Leaf_ThresholdDowngrade_FailsOldProof() public view {
+        bytes32 root = _leaf(hook.inspect(_data(1.5e18))); // single-leaf tree: root == leaf, empty proof
+        bytes32[] memory proof = new bytes32[](0);
+
+        assertTrue(MerkleProof.verify(proof, root, _leaf(hook.inspect(_data(1.5e18)))), "intended threshold");
+        assertFalse(MerkleProof.verify(proof, root, _leaf(hook.inspect(_data(WAD)))), "downgraded threshold");
+        assertFalse(MerkleProof.verify(proof, root, _leaf(hook.inspect(_data(3e18)))), "upgraded threshold");
+    }
+
+    /// @dev == SuperVaultAggregator._createLeaf
+    function _leaf(bytes memory hookArgs) internal view returns (bytes32) {
+        return keccak256(bytes.concat(keccak256(abi.encode(address(hook), hookArgs))));
     }
 
     function test_Inspect_RevertIf_HeaderNotMarketKey() public {
