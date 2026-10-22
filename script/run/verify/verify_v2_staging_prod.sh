@@ -28,7 +28,7 @@ CHAINS_TO_VERIFY=(8453) # Base: Aave V4 V2 / standalone / idle hooks (SUP-21140)
 # CHAINS_TO_VERIFY=(10 137 130 59144 80094 146 100 480 999 988)
 
 # Specify which contracts to verify (empty = all contracts found in deployment JSON)
-CONTRACTS_TO_VERIFY=(AaveV4SupplyAndBorrowHookV2 AaveV4RepayHookV2 AaveV4RepayAndWithdrawHookV2 AaveV4SupplyHookV2 AaveV4BorrowHookV2 AaveV4WithdrawHookV2 AaveV4LendHook AaveV4RedeemHook)
+CONTRACTS_TO_VERIFY=(MorphoHealthCheckHook AaveV4HealthCheckHook)
 # CONTRACTS_TO_VERIFY=(ApproveAndStargateSendHook StargateSendHook)
 
 # Delay in seconds between verification requests (prevents Cloudflare rate limiting)
@@ -476,7 +476,7 @@ generate_constructor_args() {
         "SuperVaultYieldSourceOracle")
             echo "$(cast abi-encode "constructor(address)" "$super_ledger_config")"
             ;;
-        "MorphoSupplyAndBorrowHook"|"MorphoBorrowHook"|"MorphoRepayHook"|"MorphoRepayAndWithdrawHook"|"MorphoSupplyHook"|"MorphoWithdrawHook"|"MorphoLendHook")
+        "MorphoSupplyAndBorrowHook"|"MorphoBorrowHook"|"MorphoRepayHook"|"MorphoRepayAndWithdrawHook"|"MorphoSupplyHook"|"MorphoWithdrawHook"|"MorphoLendHook"|"MorphoHealthCheckHook")
             local morpho_address=""
             case $chain_id in
                 "1") morpho_address="0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb" ;;
@@ -505,7 +505,7 @@ generate_constructor_args() {
         "FeeSplittingHook")
             echo "$(cast abi-encode "constructor(address)" "$native_token")"
             ;;
-        "AaveV4BorrowHook"|"AaveV4RepayAndWithdrawHook"|"AaveV4RepayHook"|"AaveV4SupplyAndBorrowHook"|"AaveV4SupplyHook"|"AaveV4WithdrawHook")
+        "AaveV4BorrowHook"|"AaveV4RepayAndWithdrawHook"|"AaveV4RepayHook"|"AaveV4SupplyAndBorrowHook"|"AaveV4SupplyHook"|"AaveV4WithdrawHook"|"AaveV4HealthCheckHook")
             echo "$(cast abi-encode "constructor()")"
             ;;
         "CCTPSendHook"|"ApproveAndCCTPSendHook")

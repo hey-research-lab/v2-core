@@ -48,9 +48,10 @@ import {
 ///      `type(uint256).max` without touching the oracle (Morpho's own short-circuit).
 ///      ORACLE. The V2 loan hooks treat the oracle as identity only ("never priced") so a manipulated price can
 ///      never size an amount they move. This hook is the one documented exception: `price()` feeds a `>=`
-///      comparison and nothing else. A reverting oracle fails the userOp closed; a high price passes only what
-///      Morpho itself would consider healthy at that instant (same oracle, same math); a low price reverts a
-///      healthy position — fail-closed in every direction.
+///      comparison and nothing else. A reverting oracle fails the userOp closed and a low price reverts a healthy
+///      position (fail-closed). A HIGH price overstates collateral for Morpho and this guard alike: the guard is
+///      conservative relative to the venue's contemporaneous oracle and math, not an independent price-integrity
+///      or executable-exit check.
 ///      WHERE THE CHECK RUNS. `_buildHookExecutions` returns no executions, so `build()` yields exactly
 ///      `[preExecute, postExecute]`. The executor builds hook N only after hook N-1 executed, so the build-time
 ///      read already observes post-action state; `_postExecute` repeats the read as the authoritative one from

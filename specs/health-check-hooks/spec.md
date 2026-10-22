@@ -111,11 +111,11 @@ See `technical-spec.md` → Acceptance Criteria.
 
 | Risk | Mitigation |
 |---|---|
-| Morpho oracle manipulation | Price feeds a `>=` comparison only, never sizes an amount; same oracle and math as Morpho's `_isHealthy`, so the guard is never looser than the venue; reverting / low oracle fails closed |
+| Morpho oracle manipulation | Price feeds a `>=` comparison only, never sizes an amount; same oracle and math as Morpho's `_isHealthy`, so the guard is never looser than the venue. A reverting or LOW price fails closed. A HIGH price overstates collateral for Morpho and the guard alike, so the guard is conservative only relative to the venue's contemporaneous oracle and math; it is not an independent price-integrity or executable-exit check |
 | Aave V4 stale dynamic-config keys | After BORROW / flagged RELEASE the keys are fresh (the leg refreshed them). After PLEDGE-only or swap-only legs the figure may be optimistic if governance tightened a collateral factor; documented, OMS sizes with margin above 1e18 |
 | Executor builds hooks before executing earlier ones (future change) | Check repeated in `_postExecute`, which always runs after every preceding hook inside the account batch |
 | Zero-IRM Morpho market | Rejected at decode (`expectedBorrowBalances` has no zero-IRM guard) |
-| Aave struct reshape upstream | 7-word ABI decode fails loudly |
+| Aave struct reshape upstream | Only a TRUNCATED return (fewer than 7 words) reverts the decode. A same-width REORDER is silently mis-decoded: a RAY-scaled collateral/debt value in word 2 satisfies any WAD threshold and the guard fails OPEN (see the `IAaveV4Spoke.getUserAccountData` warning). Backstop: the pinned mainnet-fork test re-verifies field order; re-verify against the live Spoke before adopting a new Spoke implementation |
 | Threshold mis-signing below liquidation | `minHealthFactor >= 1e18` enforced |
 
 ## Open Questions (Resolved)

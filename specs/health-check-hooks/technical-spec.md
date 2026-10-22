@@ -149,7 +149,11 @@ Not applicable — the guard moves nothing. A compromised oracle degrades it to 
 
 ## Dependencies & Risks
 - Morpho Blue `ORACLE_PRICE_SCALE = 1e36` pinned locally (not vendored).
-- Aave V4 Spoke is governance-upgradeable; a struct reshape fails the 7-word decode loudly.
+- Aave V4 Spoke is governance-upgradeable. A truncated `getUserAccountData` return reverts the 7-word decode; a
+  same-width field REORDER does not and would fail open (a RAY value lands in the health slot). Field order is an
+  unchecked ABI assumption pinned by the mainnet-fork test; re-verify it before adopting a new Spoke implementation.
+- Morpho: the guard shares Morpho's oracle and math, so it is never looser than the venue at that instant. It is not
+  an independent price-integrity check: a HIGH oracle price overstates collateral for both.
 
 ## References & Research
 - `.claude/doc/health-check-hooks/plan.md`, `.claude/sessions/context_session_47.md`
