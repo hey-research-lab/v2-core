@@ -50,7 +50,7 @@ def compare_contracts(main_contracts, network_contracts, network_name):
 def main():
     # Set up paths relative to script location
     script_dir = Path(__file__).parent
-    base_dir = script_dir.parent.parent  # Go up to project root
+    base_dir = script_dir.parent.parent.parent  # script/run/tooling -> project root
     output_dir = base_dir / "script" / "output" / "prod"
     
     main_file = output_dir / "latest.json"

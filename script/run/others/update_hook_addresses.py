@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 LOCKED_BYTECODE_DIR = os.path.join(PROJECT_ROOT, "script/locked-bytecode")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "script/output/prod")
 
